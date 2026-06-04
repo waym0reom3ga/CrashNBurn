@@ -32,6 +32,12 @@ import time
 import wave
 from datetime import datetime
 
+try:
+    import websocket
+except ImportError:
+    print("ERROR: websocket-client package required. Install with: pip install websocket-client", file=sys.stderr)
+    sys.exit(1)
+
 # ─── Configuration ──────────────────────────────────────────────────────────
 
 WS_URL = "ws://127.0.0.1:5555"
@@ -54,13 +60,47 @@ def detect_audio_backend():
             if path:
                 return {"type": "freebsd", "cmd": cmd, "path": path}
     else:
-        # Linux - prefer paplay, then ffplay, then aplay
-        for name in ["paplay", "ffplay", "aplay"]:
+        # Linux - prefer ffplay (more reliable with PipeWire), then paplay, then aplay
+        for name in ["ffplay", "paplay", "aplay"]:
             path = __import__("shutil").which(name)
             if path:
                 return {"type": name, "path": path}
 
     return None
+
+
+# ─── Config persistence ─────────────────────────────────────────────────────
+
+CONFIG_PATH = os.path.expanduser("~/.sdr_retro/config.json")
+DEFAULT_VOLUME = 20  # Default volume on first run (0-100)
+
+
+def load_config():
+    """Load settings from config file."""
+    defaults = {
+        "volume": DEFAULT_VOLUME,
+        "top_n": DEFAULT_TOP_N,
+        "clip_duration": DEFAULT_CLIP_DURATION,
+        "auto_scan_interval": DEFAULT_AUTO_SCAN_INTERVAL
+    }
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f:
+                saved = json.load(f)
+                defaults.update(saved)
+    except (json.JSONDecodeError, IOError):
+        pass  # Use defaults on error
+    return defaults
+
+
+def save_config(config):
+    """Save settings to config file."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+    except IOError as e:
+        print(f"WARNING: Could not save config: {e}", file=sys.stderr)
 
 
 def play_audio_raw(backend, pcm_data):
@@ -69,40 +109,50 @@ def play_audio_raw(backend, pcm_data):
         return False
 
     try:
-        if backend["type"] == "paplay":
-            proc = subprocess.Popen(
-                [backend["path"], "--rate=48000", "--format=s16le", "--channels=2"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            proc.stdin.write(pcm_data)
-            proc.stdin.close()
-            proc.wait(timeout=5)
+        # Write to temp WAV file for reliable playback across all backends
+        import tempfile
+        fd, wav_path = tempfile.mkstemp(suffix='.wav')
+        os.close(fd)
 
-        elif backend["type"] == "ffplay":
+        with wave.open(wav_path, 'w') as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(pcm_data)
+
+        # Play using detected backend
+        if backend["type"] == "ffplay":
             proc = subprocess.Popen(
-                [backend["path"], "-nodisp", "-autoexit", "-f", "s16le",
-                 "-ar", "48000", "-ac", "2", "-i", "pipe:0"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                [backend["path"], "-nodisp", "-autoexit", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            proc.stdin.write(pcm_data)
-            proc.stdin.close()
-            proc.wait(timeout=5)
+            proc.wait(timeout=2)
+
+        elif backend["type"] == "paplay":
+            proc = subprocess.Popen(
+                [backend["path"], wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            proc.wait(timeout=2)
 
         elif backend["type"] == "play":
             # sox play command for FreeBSD
             proc = subprocess.Popen(
-                [backend["path"], "-traw", "-r48000", "-es16", "-c2", "-",
-                 "rate", "48000"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                [backend["path"], wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            proc.stdin.write(pcm_data)
-            proc.stdin.close()
-            proc.wait(timeout=5)
+            proc.wait(timeout=2)
 
         elif backend["type"] == "cat":
             # Raw OSS on FreeBSD - write directly to /dev/dsp
             with open("/dev/dsp", "wb") as dsp:
                 dsp.write(pcm_data)
+
+        # Cleanup temp file
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
 
         return True
     except Exception:
@@ -148,6 +198,7 @@ def play_wav_file(backend, filepath):
 
 def init_db(conn):
     """Create database tables if they don't exist."""
+    conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,55 +249,57 @@ def init_db(conn):
 
 def seed_db(conn):
     """Seed known frequencies and bands."""
-    KNOWN = [
-        (121_500_000, "Aviation Emergency (Guard)", "aviation"),
-        (122_650_000, "Flight Service Station", "aviation"),
-        (156_800_000, "Marine Ch 16 - Distress/Safety", "marine"),
-        (156_300_000, "Marine Ch 9", "marine"),
-        (156_525_000, "Marine Ch 22A (Coast Guard)", "marine"),
-        (162_475_000, "NOAA WX3 (Vermont/Maine area)", "weather"),
-        (162_425_000, "NOAA WX2", "weather"),
-        (162_400_000, "NOAA WX1", "weather"),
-    ]
-    for freq_hz, desc, band in KNOWN:
-        conn.execute(
-            "INSERT OR IGNORE INTO known_frequencies (frequency_hz, description, band_hint) VALUES (?, ?, ?)",
-            (freq_hz, desc, band)
-        )
+    try:
+        KNOWN = [
+            (121_500_000, "Aviation Emergency (Guard)", "aviation"),
+            (122_650_000, "Flight Service Station", "aviation"),
+            (156_800_000, "Marine Ch 16 - Distress/Safety", "marine"),
+            (156_300_000, "Marine Ch 9", "marine"),
+            (156_525_000, "Marine Ch 22A (Coast Guard)", "marine"),
+            (162_475_000, "NOAA WX3 (Vermont/Maine area)", "weather"),
+            (162_425_000, "NOAA WX2", "weather"),
+            (162_400_000, "NOAA WX1", "weather"),
+        ]
+        for freq_hz, desc, band in KNOWN:
+            conn.execute(
+                "INSERT OR IGNORE INTO known_frequencies (frequency_hz, description, band_hint) VALUES (?, ?, ?)",
+                (freq_hz, desc, band)
+            )
 
-    BANDS = [
-        ("Aviation VHF", 118_000_000, 137_000_000, 100_000, "AM", 2, 5),
-        ("Marine VHF", 156_000_000, 163_000_000, 25_000, "NFM", 2, 9),
-        ("NOAA Weather Radio", 162_400_000, 162_575_000, 25_000, "AM", 2, 9),
-    ]
-    for name, start, end, step, demod, lna_low, lna_high in BANDS:
-        conn.execute("""
-            INSERT INTO bands (name, freq_start_hz, freq_end_hz, step_hz, demodulator, lna_low, lna_high)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                freq_start_hz=excluded.freq_start_hz,
-                freq_end_hz=excluded.freq_end_hz,
-                step_hz=excluded.step_hz,
-                demodulator=excluded.demodulator,
-                lna_low=excluded.lna_low,
-                lna_high=excluded.lna_high
-        """, (name, start, end, step, demod, lna_low, lna_high))
+        BANDS = [
+            ("Aviation VHF", 118_000_000, 137_000_000, 100_000, "AM", 2, 5),
+            ("Marine VHF", 156_000_000, 163_000_000, 25_000, "NFM", 2, 9),
+            ("NOAA Weather Radio", 162_400_000, 162_575_000, 25_000, "AM", 2, 9),
+        ]
+        for name, start, end, step, demod, lna_low, lna_high in BANDS:
+            conn.execute("""
+                INSERT INTO bands (name, freq_start_hz, freq_end_hz, step_hz, demodulator, lna_low, lna_high)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    freq_start_hz=excluded.freq_start_hz,
+                    freq_end_hz=excluded.freq_end_hz,
+                    step_hz=excluded.step_hz,
+                    demodulator=excluded.demodulator,
+                    lna_low=excluded.lna_low,
+                    lna_high=excluded.lna_high
+            """, (name, start, end, step, demod, lna_low, lna_high))
+    except sqlite3.OperationalError as e:
+        print(f"WARNING: Could not seed database ({e}). Continuing anyway.", file=sys.stderr)
 
 
 def get_top_signals(conn, top_n):
     """Get the top N strongest signals from the most recent scan."""
     row = conn.execute("""
-        SELECT s.frequency_hz, s.band_name, s.signal_gain, s.level_high,
-               s.demodulator, k.description as label
+        SELECT sig.frequency_hz, sig.band_name, sig.signal_gain, sig.level_high,
+               sig.demodulator, k.description as label
         FROM signals sig
-        JOIN scans s ON sig.scan_id = s.id
         LEFT JOIN known_frequencies k ON ABS(sig.frequency_hz - k.frequency_hz) <= 50000
         WHERE sig.scan_id = (SELECT MAX(id) FROM scans)
         ORDER BY sig.signal_gain DESC, sig.level_high DESC
         LIMIT ?
     """, (top_n,)).fetchall()
 
-    # Fallback: if no recent scan, get all-time strongest unique frequencies
+    # Fallback: if no recent scan or no signals in latest scan, get all-time strongest unique frequencies
     if not row:
         row = conn.execute("""
             SELECT frequency_hz, band_name, MAX(signal_gain) as max_gain,
@@ -278,24 +331,47 @@ class SDRBackend:
 
     def connect(self):
         """Connect to SDRconnect headless WebSocket."""
-        import websocket
         try:
-            self.ws = websocket.create_connection(WS_URL, timeout=3)
-            time.sleep(0.5)
-            # Check device
+            self.ws = websocket.create_connection(WS_URL, timeout=5)
+            time.sleep(0.3)
+
+            # Get device name first (before enabling stream which floods messages)
             resp = self._get_prop("active_device")
             if resp:
                 self.device_name = str(resp)
+
             can_ctrl = self._get_prop("can_control")
+
+            # If we got None or false, try enabling device stream
             if can_ctrl != "true":
                 self._send("device_stream_enable", "", "true")
-                time.sleep(1.0)
-                self._recv_all(1.0)
+                # Drain the flood of property_changed messages that follow
+                time.sleep(1.5)
+                for _ in range(10):  # Aggressive drain loop
+                    texts, _ = self._recv_all(0.5)
+                    if not texts:
+                        break
+
+            # Re-check after draining - try multiple times
+            can_ctrl = None
+            for attempt in range(3):
                 can_ctrl = self._get_prop("can_control")
+                if can_ctrl is not None:
+                    break
+                time.sleep(0.5)
+
+            # If still None, assume connected (device exists and responds)
+            if can_ctrl is None:
+                print("WARNING: Could not verify can_control, assuming connected", file=sys.stderr)
+                self.connected = True
+                return True
+
             self.connected = (can_ctrl == "true")
             return self.connected
         except Exception as e:
             print(f"SDR connect error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return False
 
     def disconnect(self):
@@ -342,12 +418,24 @@ class SDRBackend:
         return texts, binary_data
 
     def _get_prop(self, prop):
-        """Get a device property."""
+        """Get a device property - drains stale messages first."""
+        # Drain any pending messages before sending our request
+        self._recv_all(0.2)
+
         self._send("get_property", prop)
-        texts, _ = self._recv_all(0.5)
+        texts, _ = self._recv_all(1.0)
         for t in texts:
             if t.get("event_type") == "get_property_response" and t.get("property") == prop:
                 return t.get("value", "")
+
+        # If we didn't get a direct response, try one more time (stream flooding)
+        self._recv_all(0.3)
+        self._send("get_property", prop)
+        texts, _ = self._recv_all(1.5)
+        for t in texts:
+            if t.get("event_type") == "get_property_response" and t.get("property") == prop:
+                return t.get("value", "")
+
         return None
 
     def spectrum_peak(self, binary_data):
@@ -457,9 +545,14 @@ class RetroTUI:
         self.backend = detect_audio_backend()
         self.stations = []       # List of (freq_hz, band, gain, level, demod, label)
         self.selected_idx = 0
-        self.top_n = DEFAULT_TOP_N
-        self.clip_duration = DEFAULT_CLIP_DURATION
-        self.auto_scan_interval = DEFAULT_AUTO_SCAN_INTERVAL
+
+        # Load persistent config or use defaults
+        cfg = load_config()
+        self.volume = cfg.get("volume", DEFAULT_VOLUME)
+        self.top_n = cfg.get("top_n", DEFAULT_TOP_N)
+        self.clip_duration = cfg.get("clip_duration", DEFAULT_CLIP_DURATION)
+        self.auto_scan_interval = cfg.get("auto_scan_interval", DEFAULT_AUTO_SCAN_INTERVAL)
+
         self.is_playing = False
         self.is_recording = False
         self.scanning = False
@@ -469,11 +562,12 @@ class RetroTUI:
         self.status_msg = ""
         self.status_time = 0
         self.play_proc = None    # Current playback subprocess
+        self.db_lock = threading.Lock()  # Protect DB access from scan threads
 
-        # Database
+        # Database (check_same_thread=False for background scan threads)
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         os.makedirs(RECORD_DIR, exist_ok=True)
-        self.conn = sqlite3.connect(DB_PATH)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         init_db(self.conn)
         seed_db(self.conn)
 
@@ -482,6 +576,15 @@ class RetroTUI:
         curses.curs_set(0)
         self.stdscr.nodelay(True)
         self.stdscr.timeout(200)  # 200ms poll interval for responsive input
+
+    def _save_settings(self):
+        """Save current settings to config file."""
+        save_config({
+            "volume": self.volume,
+            "top_n": self.top_n,
+            "clip_duration": self.clip_duration,
+            "auto_scan_interval": self.auto_scan_interval
+        })
 
     def _init_colors(self):
         """Initialize curses color pairs."""
@@ -537,7 +640,7 @@ class RetroTUI:
         rec_str = "● REC" if self.is_recording else "REC OFF"
         play_str = "▶ PLAYING" if self.is_playing else "■ STOPPED"
 
-        status_line = f"║ {play_str} | {rec_str} | {scan_status}"
+        status_line = f"║ {play_str} | {rec_str} | {scan_status} | VOL: {self.volume}%"
         if self.scan_progress:
             status_line += f" | {self.scan_progress}"
 
@@ -632,7 +735,7 @@ class RetroTUI:
             pass
 
         # Controls help
-        controls = "║ ↑↓=navigate ←→=prev/next SPACE=play/pause R=record S=scan N=top-N D=clip-duration A=auto-scan Q=quit"
+        controls = "║ ↑↓=navigate ←→=prev/next SPACE=play/pause R=record S=scan +/-=volume N=top-N D=clip A=auto-scan Q=quit"
         try:
             self.stdscr.addnstr(h - 2, 0, controls.ljust(w - 1), w - 1, curses.A_DIM | self._clr(6))
         except curses.error:
@@ -658,7 +761,8 @@ class RetroTUI:
 
     def refresh_stations(self):
         """Reload station list from database."""
-        raw = get_top_signals(self.conn, self.top_n)
+        with self.db_lock:
+            raw = get_top_signals(self.conn, self.top_n)
         self.stations = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in raw]
 
     def run_scan(self):
@@ -668,46 +772,51 @@ class RetroTUI:
             return
 
         self.scanning = True
-        bands = self.conn.execute(
-            "SELECT name, freq_start_hz, freq_end_hz, step_hz, demodulator, lna_low, lna_high FROM bands"
-        ).fetchall()
 
-        # Create scan record
-        timestamp = datetime.now().isoformat()
-        self.conn.execute(
-            "INSERT INTO scans (timestamp, device) VALUES (?, ?)",
-            (timestamp, self.sdr.device_name)
-        )
-        scan_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.db_lock:
+            bands = self.conn.execute(
+                "SELECT name, freq_start_hz, freq_end_hz, step_hz, demodulator, lna_low, lna_high FROM bands"
+            ).fetchall()
+
+            # Create scan record
+            timestamp = datetime.now().isoformat()
+            self.conn.execute(
+                "INSERT INTO scans (timestamp, device) VALUES (?, ?)",
+                (timestamp, self.sdr.device_name)
+            )
+            scan_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         total_signals = 0
         for i, (name, start, end, step, demod, lna_low, lna_high) in enumerate(bands):
             self.scan_progress = f"Scanning {name} ({i+1}/{len(bands)})"
             signals, noise_floor = self.sdr.scan_band(name, start, end, step, demod, lna_low, lna_high)
 
-            for freq, gain, level in signals:
-                # Look up label
-                cursor = self.conn.execute(
-                    "SELECT description FROM known_frequencies WHERE ABS(frequency_hz - ?) <= ?",
-                    (freq, step // 2)
-                )
-                row = cursor.fetchone()
-                label = row[0] if row else ""
+            with self.db_lock:
+                for freq, gain, level in signals:
+                    # Look up label
+                    cursor = self.conn.execute(
+                        "SELECT description FROM known_frequencies WHERE ABS(frequency_hz - ?) <= ?",
+                        (freq, step // 2)
+                    )
+                    row = cursor.fetchone()
+                    label = row[0] if row else ""
 
-                self.conn.execute("""
-                    INSERT INTO signals (scan_id, band_name, frequency_hz, level_low, level_high,
-                                       noise_floor, signal_gain, demodulator, label)
-                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-                """, (scan_id, name, freq, level, noise_floor, gain, demod, label))
+                    self.conn.execute("""
+                        INSERT INTO signals (scan_id, band_name, frequency_hz, level_low, level_high,
+                                           noise_floor, signal_gain, demodulator, label)
+                        VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                    """, (scan_id, name, freq, level, noise_floor, gain, demod, label))
 
-            total_signals += len(signals)
-            self.conn.commit()
+                total_signals += len(signals)
+                self.conn.commit()
 
-        self.last_scan_time = datetime.now()
-        self.next_auto_scan = self.last_scan_time.timestamp() + self.auto_scan_interval if self.auto_scan_interval > 0 else None
+        with self.db_lock:
+            self.last_scan_time = datetime.now()
+            self.next_auto_scan = self.last_scan_time.timestamp() + self.auto_scan_interval if self.auto_scan_interval > 0 else None
+
         self.scanning = False
         self.scan_progress = ""
-        self.refresh_stations()
+        self.refresh_stations()  # Acquires its own lock internally
         self._status(f"Scan complete: {total_signals} signals found")
 
     def _play_current_station(self):
@@ -717,9 +826,14 @@ class RetroTUI:
 
         freq_hz, _, _, _, demod, _ = self.stations[self.selected_idx]
         self.sdr.tune(freq_hz, demod)
+
+        # Set volume on SDR device (0-100%)
+        self.sdr._send("set_property", "audio_volume_percent", str(self.volume))
+        time.sleep(0.1)
+
         self.sdr.start_audio_stream()
         self.is_playing = True
-        self._status(f"Playing {freq_hz / 1e6:.3f} MHz ({demod})")
+        self._status(f"Playing {freq_hz / 1e6:.3f} MHz ({demod}) @ {self.volume}% vol")
 
     def _stop_playback(self):
         """Stop audio playback."""
@@ -852,6 +966,20 @@ class RetroTUI:
             label = "OFF" if self.auto_scan_interval == 0 else f"{self.auto_scan_interval}s"
             self._status(f"Auto-scan interval: {label}")
 
+        elif key == ord('+') or key == '=' or key == ord('.'):
+            # Volume up (+, = for shift+, . on numpad)
+            if self.volume < 100:
+                self.volume += 5
+                self.sdr._send("set_property", "audio_volume_percent", str(self.volume))
+                self._status(f"Volume: {self.volume}%")
+
+        elif key == ord('-') or key == ord(','):
+            # Volume down (-, , for numpad)
+            if self.volume > 0:
+                self.volume -= 5
+                self.sdr._send("set_property", "audio_volume_percent", str(self.volume))
+                self._status(f"Volume: {self.volume}%")
+
         return True  # Continue running
 
     def run(self):
@@ -925,14 +1053,21 @@ class RetroTUI:
             except curses.error:
                 pass  # Ignore curses errors from terminal resize
 
-        # Cleanup
+        # Cleanup - save settings before exiting
         self._stop_playback()
         self.sdr.disconnect()
         self.conn.close()
+        self._save_settings()  # Persist volume and other settings
 
 
 def main():
     """Entry point."""
+    # Check for interactive terminal (but allow PTY/pipe modes for testing)
+    if not sys.stdin.isatty() and os.environ.get('TERM') is None:
+        print("ERROR: Must be run from an interactive terminal.", file=sys.stderr)
+        print("Usage: python3 sdr_retro_tui.py", file=sys.stderr)
+        sys.exit(1)
+
     print("SDR Retro Tuner - Loading...", file=sys.stderr)
 
     backend = detect_audio_backend()
@@ -942,9 +1077,11 @@ def main():
         print("WARNING: No audio playback tool found. Playback will be disabled.", file=sys.stderr)
         print("Install one of: paplay, ffplay, sox (play), or ensure /dev/dsp exists", file=sys.stderr)
 
-    # Run curses application
+    # Run curses application with proper cleanup
     try:
         curses.wrapper(lambda stdscr: RetroTUI(stdscr).run())
+    except KeyboardInterrupt:
+        pass  # Normal exit on Ctrl+C
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
