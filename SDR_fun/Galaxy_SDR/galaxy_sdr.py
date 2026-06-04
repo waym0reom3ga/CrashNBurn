@@ -8,6 +8,8 @@ Features:
   - Full-scan mode across entire device range
   - Band selection menu to filter displayed signals
   - Persistent settings (volume, top-N, clip duration)
+  - CRT visual effects engine (scanlines, phosphor glow, noise, flicker, vignette)
+  - 5 color themes: phosphor_green, amber, blue, white, synthwave
 
 Controls:
   Up/Down arrows   Navigate station list
@@ -17,6 +19,7 @@ Controls:
   S                Trigger band scan (selected bands only)
   F                Full device scan (entire range, all gain levels)
   B                Band selection menu (toggle which bands to display)
+  T                CRT settings menu (themes, effects toggles)
   +/-              Volume up/down (5% steps)
   N                Cycle top-N count (10/20/30/50/100)
   D                Cycle clip duration (10/15/30/60s)
@@ -46,6 +49,19 @@ except ImportError:
     print("ERROR: websocket-client required. Install: pip install websocket-client", file=sys.stderr)
     sys.exit(1)
 
+# Import CRT effects engine
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from crt_effects import (
+    CRTEngine,
+    CRTConfig,
+    THEMES,
+    theme_pair,
+    reset_color_pairs,
+    boot_animation,
+    draw_settings_menu,
+    handle_settings_input,
+)
+
 # ─── Configuration ──────────────────────────────────────────────────────────
 
 WS_URL = "ws://127.0.0.1:5555"
@@ -57,6 +73,7 @@ DEFAULT_VOLUME = 5
 DEFAULT_TOP_N = 50
 DEFAULT_CLIP_DURATION = 30
 DEFAULT_AUTO_SCAN_INTERVAL = 0  # Off by default
+
 
 # ─── Comprehensive Band Database ────────────────────────────────────────────
 # Based on ITU frequency allocations and common SDR usage.
@@ -205,6 +222,7 @@ def load_config():
         "clip_duration": DEFAULT_CLIP_DURATION,
         "auto_scan_interval": DEFAULT_AUTO_SCAN_INTERVAL,
         "selected_bands": [],  # List of band names to display (empty = all)
+        "crt_effects": None,   # CRT settings dict (or None for defaults)
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -524,19 +542,10 @@ class SDRBackend:
         return signals
 
 
-# ─── Retro TUI Renderer ─────────────────────────────────────────────────────
+# ─── CRT TUI Renderer ──────────────────────────────────────────────────────
 
 class RetroTUI:
-    """Cool-Retro-Term style curses interface."""
-
-    COLORS = {
-        "bg": 0,
-        "green": 2,
-        "dim_green": 6,
-        "bright": 3,
-        "amber": 4,
-        "red": 5,
-    }
+    """CRT-style curses interface with visual effects engine."""
 
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -553,6 +562,13 @@ class RetroTUI:
         self.auto_scan_interval = cfg.get("auto_scan_interval", DEFAULT_AUTO_SCAN_INTERVAL)
         self.selected_bands = cfg.get("selected_bands", [])  # Empty = show all
 
+        # CRT effects setup
+        self.crt_cfg = CRTConfig()
+        if cfg.get("crt_effects"):
+            self.crt_cfg.from_dict(cfg["crt_effects"])
+
+        self.crt_engine = CRTEngine(self.crt_cfg)
+
         self.is_playing = False
         self.is_recording = False
         self.scanning = False
@@ -563,6 +579,10 @@ class RetroTUI:
         self.status_time = 0
         self.play_proc = None
         self.db_lock = threading.Lock()
+
+        # Settings menu state
+        self._settings_mode = False
+        self._settings_cursor = 0
 
         # Database setup
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -585,12 +605,14 @@ class RetroTUI:
             "clip_duration": self.clip_duration,
             "auto_scan_interval": self.auto_scan_interval,
             "selected_bands": self.selected_bands,
+            "crt_effects": self.crt_cfg.to_dict(),
         })
 
     def _init_colors(self):
-        """Initialize curses color pairs."""
+        """Initialize curses color pairs for CRT themes."""
         curses.start_color()
         curses.use_default_colors()
+        # Initialize base pairs (fallback)
         curses.init_pair(1, curses.COLOR_BLACK, -1)
         curses.init_pair(2, curses.COLOR_GREEN, -1)
         curses.init_pair(3, curses.COLOR_GREEN, -1)
@@ -599,72 +621,136 @@ class RetroTUI:
         curses.init_pair(6, curses.COLOR_GREEN, -1)
 
     def _clr(self, pair_num):
+        """Get color attribute for legacy pairs."""
         return curses.color_pair(pair_num)
 
+    def _tpair(self, key, bg=None):
+        """Get theme-aware color pair attribute."""
+        try:
+            return theme_pair(self.crt_cfg.theme, key, bg)
+        except Exception:
+            # Fallback to green if theme fails
+            return curses.color_pair(2)
+
     def _dim(self, text, max_width):
+        """Truncate text with ellipsis if needed."""
         if len(text) > max_width:
-            return text[:max_width - 1] + "…"
+            return text[:max_width - 1] + "\u2026"
         return text.ljust(max_width)
 
     def _bar(self, value, max_val, width=8):
+        """Render signal strength bar with block characters."""
         filled = int((value / max(1, max_val)) * width)
-        return "[" + "█" * filled + "░" * (width - filled) + "]"
+        # Use theme-appropriate characters
+        if self.crt_cfg.theme == "synthwave":
+            return "[" + "\u2588" * filled + "\u2591" * (width - filled) + "]"
+        return "[" + "\u2588" * filled + "\u2591" * (width - filled) + "]"
+
+    def _apply_crt_effects(self):
+        """Apply CRT visual effects overlay to the screen."""
+        h, w = self.stdscr.getmaxyx()
+        flicker_attr = self.crt_engine.get_flicker_attr()
+        noise_chars = THEMES[self.crt_cfg.theme]["noise_ch"]
+
+        # Apply phosphor glow background
+        if self.crt_cfg.phosphor_glow:
+            try:
+                bg_attr = theme_pair(self.crt_cfg.theme, "glow")
+                self.stdscr.bkgd(" ", bg_attr)
+            except curses.error:
+                pass
+
+        # Overlay effects on each row
+        for row in range(h):
+            is_scanline = self.crt_engine.scanline_dim(row)
+            smear = self.crt_engine.smear_active()
+
+            for col in range(w - 1):
+                # Check vignette first (corners/edges)
+                if self.crt_engine.vignette_dim(row, col, h, w):
+                    try:
+                        self.stdscr.addch(row, col, " ",
+                                        theme_pair(self.crt_cfg.theme, "glow") | curses.A_DIM)
+                    except curses.error:
+                        pass
+                    continue
+
+                # Check static noise
+                if self.crt_engine.should_noise(row, col):
+                    try:
+                        ch = random.choice(noise_chars)
+                        self.stdscr.addch(row, col, ch,
+                                        theme_pair(self.crt_cfg.theme, "dim") | curses.A_DIM | flicker_attr)
+                    except curses.error:
+                        pass
+                    continue
+
+                # Apply scanline dimming
+                if is_scanline:
+                    try:
+                        existing = self.stdscr.inch(row, col) & 0xFF
+                        if existing and chr(existing).strip():
+                            self.stdscr.addch(row, col, chr(existing),
+                                            theme_pair(self.crt_cfg.theme, "dim") | curses.A_DIM | flicker_attr)
+                    except curses.error:
+                        pass
 
     def _draw_header(self):
         """Draw the retro CRT header."""
         h, w = self.stdscr.getmaxyx()
 
         try:
-            self.stdscr.addnstr(0, 0, "╔" + "═" * (w - 2) + "╗", w - 1, self._clr(4))
+            border_attr = theme_pair(self.crt_cfg.theme, "bright") | curses.A_BOLD
+            self.stdscr.addnstr(0, 0, "\u256d" + "\u2500" * (w - 2) + "\u256f", w - 1, border_attr)
         except curses.error:
             pass
 
         # Device info line
         dev_str = f"{self.sdr.device_name}" if self.sdr.connected else "DISCONNECTED"
         range_str = f"{self.sdr.freq_range[0]/1e6:.1f}-{self.sdr.freq_range[1]/1e6:.0f} MHz"
-        title_line = f"║ GALAXY SDR | {dev_str:<25} | Range: {range_str}"
+        title_line = f"\u2502 GALAXY SDR | {dev_str:<25} | Range: {range_str}"
 
         try:
-            self.stdscr.addnstr(1, 0, title_line.ljust(w - 1), w - 1, curses.A_BOLD | self._clr(4))
+            self.stdscr.addnstr(1, 0, title_line.ljust(w - 1), w - 1, curses.A_BOLD | theme_pair(self.crt_cfg.theme, "bright"))
         except curses.error:
             pass
 
         # Status row
         scan_status = "SCANNING..." if self.scanning else ("AUTO-SCAN ON" if self.auto_scan_interval > 0 else "MANUAL")
-        rec_str = "● REC" if self.is_recording else "REC OFF"
-        play_str = "▶ PLAYING" if self.is_playing else "■ STOPPED"
+        rec_str = "\u25cf REC" if self.is_recording else "REC OFF"
+        play_str = "\u25b6 PLAYING" if self.is_playing else "\u25a0 STOPPED"
 
         band_filter = f"Bands: {len(self.selected_bands)} selected" if self.selected_bands else "Bands: ALL"
-        status_line = f"║ {play_str} | {rec_str} | {scan_status} | VOL: {self.volume}% | {band_filter}"
+        status_line = f"\u2502 {play_str} | {rec_str} | {scan_status} | VOL: {self.volume}% | {band_filter}"
         if self.scan_progress:
             status_line += f" | {self.scan_progress}"
 
         try:
-            rec_attr = self._clr(5) if self.is_recording else self._clr(6)
-            play_attr = self._clr(2) if self.is_playing else self._clr(6)
-            self.stdscr.addnstr(2, 0, f"║ {self._dim(status_line, w - 3)}", w - 1, rec_attr | curses.A_BOLD)
+            rec_attr = theme_pair(self.crt_cfg.theme, "bright") if self.is_recording else theme_pair(self.crt_cfg.theme, "fg")
+            play_attr = theme_pair(self.crt_cfg.theme, "fg") if self.is_playing else theme_pair(self.crt_cfg.theme, "dim")
+            self.stdscr.addnstr(2, 0, f"\u2502 {self._dim(status_line, w - 3)}", w - 1, rec_attr | curses.A_BOLD)
         except curses.error:
             pass
 
         try:
-            self.stdscr.addnstr(3, 0, "╠" + "═" * (w - 2) + "╣", w - 1, self._clr(4))
+            self.stdscr.addnstr(3, 0, "\u2564" + "\u2500" * (w - 2) + "\u2565", w - 1, theme_pair(self.crt_cfg.theme, "bright"))
         except curses.error:
             pass
 
     def _draw_station_list(self):
-        """Draw the station list."""
+        """Draw the station list with CRT effects."""
         h, w = self.stdscr.getmaxyx()
         start_row = 4
 
         # Column headers
-        header = f"║ {'#':>3} {'FREQ(MHz)':>10} {'LABEL':<25} {'STR':>8} {'BAND':<18} {'DEMOD':<5}"
+        header = f"\u2502 {'#':>3} {'FREQ(MHz)':>10} {'LABEL':<25} {'STR':>8} {'BAND':<18} {'DEMOD':<5}"
         try:
-            self.stdscr.addnstr(start_row, 0, header.ljust(w - 1), w - 1, curses.A_BOLD | self._clr(4))
+            self.stdscr.addnstr(start_row, 0, header.ljust(w - 1), w - 1, curses.A_BOLD | theme_pair(self.crt_cfg.theme, "bright"))
         except curses.error:
             pass
 
         try:
-            self.stdscr.addnstr(start_row + 1, 0, "╟" + "─" * (w - 2) + "╢", w - 1, self._clr(6))
+            self.stdscr.addnstr(start_row + 1, 0, "\u256d" + "\u2500" * (w - 2) + "\u256f", w - 1, theme_pair(self.crt_cfg.theme, "dim"))
         except curses.error:
             pass
 
@@ -686,12 +772,16 @@ class RetroTUI:
             freq_hz, band_name, gain, level, demod, label = self.stations[idx]
             freq_mhz = freq_hz / 1e6
 
-            arrow = "▸" if idx == self.selected_idx else " "
+            arrow = "\u25b8" if idx == self.selected_idx else " "
             bar = self._bar(level, 255, 8)
             lbl = label[:24] if label else band_name[:24]
 
-            line = f"║ {arrow} {idx + 1:>3} {freq_mhz:10.3f} {lbl:<25} {bar} {band_name[:17]:<18} {demod:<5}"
-            attr = curses.A_REVERSE | self._clr(3) if idx == self.selected_idx else self._clr(2)
+            line = f"\u2502 {arrow} {idx + 1:>3} {freq_mhz:10.3f} {lbl:<25} {bar} {band_name[:17]:<18} {demod:<5}"
+
+            if idx == self.selected_idx:
+                attr = curses.A_REVERSE | theme_pair(self.crt_cfg.theme, "bright")
+            else:
+                attr = theme_pair(self.crt_cfg.theme, "fg")
 
             try:
                 self.stdscr.addnstr(row, 0, line.ljust(w - 1), w - 1, attr)
@@ -701,7 +791,7 @@ class RetroTUI:
         footer_row = start_row + 2 + max_rows
         if footer_row < h - 3:
             try:
-                self.stdscr.addnstr(footer_row, 0, "╠" + "═" * (w - 2) + "╣", w - 1, self._clr(4))
+                self.stdscr.addnstr(footer_row, 0, "\u2564" + "\u2500" * (w - 2) + "\u2565", w - 1, theme_pair(self.crt_cfg.theme, "bright"))
             except curses.error:
                 pass
 
@@ -712,29 +802,29 @@ class RetroTUI:
         if self.stations and 0 <= self.selected_idx < len(self.stations):
             freq_hz, band_name, gain, level, demod, label = self.stations[self.selected_idx]
             freq_mhz = freq_hz / 1e6
-            info = f"║ TUNED: {freq_mhz:.3f} MHz | Top-{self.top_n} | Clip: {self.clip_duration}s | Auto-scan: {self.auto_scan_interval}s"
+            info = f"\u2502 TUNED: {freq_mhz:.3f} MHz | Top-{self.top_n} | Clip: {self.clip_duration}s | Auto-scan: {self.auto_scan_interval}s"
         else:
-            info = f"║ No stations loaded. Press S to scan selected bands, F for full device scan."
+            info = f"\u2502 No stations loaded. Press S to scan selected bands, F for full device scan."
 
         try:
-            self.stdscr.addnstr(h - 3, 0, info.ljust(w - 1), w - 1, self._clr(6))
+            self.stdscr.addnstr(h - 3, 0, info.ljust(w - 1), w - 1, theme_pair(self.crt_cfg.theme, "dim"))
         except curses.error:
             pass
 
-        controls = "║ ↑↓=navigate ←→=prev/next SPACE=play/pause R=record S=band-scan F=full-scan B=bands +/-=vol N=top-N D=clip A=auto Q=quit"
+        controls = "\u2502 \u2191\u2193=navigate \u2190\u2192=prev/next SPACE=play/pause R=record S=band-scan F=full-scan B=bands T=crt +/-=vol N=top-N D=clip A=auto Q=quit"
         try:
-            self.stdscr.addnstr(h - 2, 0, controls.ljust(w - 1), w - 1, curses.A_DIM | self._clr(6))
+            self.stdscr.addnstr(h - 2, 0, controls.ljust(w - 1), w - 1, curses.A_DIM | theme_pair(self.crt_cfg.theme, "dim"))
         except curses.error:
             pass
 
         if self.status_msg and time.time() - self.status_time < 3:
             try:
-                self.stdscr.addnstr(h - 1, 0, f"║ {self._dim(self.status_msg, w - 3)}", w - 1, self._clr(4) | curses.A_BOLD)
+                self.stdscr.addnstr(h - 1, 0, f"\u2502 {self._dim(self.status_msg, w - 3)}", w - 1, theme_pair(self.crt_cfg.theme, "bright") | curses.A_BOLD)
             except curses.error:
                 pass
 
         try:
-            self.stdscr.addnstr(h - 1, 0, "╚" + "═" * (w - 2) + "╝", w - 1, self._clr(4))
+            self.stdscr.addnstr(h - 1, 0, "\u2570" + "\u2500" * (w - 2) + "\u256f", w - 1, theme_pair(self.crt_cfg.theme, "bright"))
         except curses.error:
             pass
 
@@ -886,7 +976,7 @@ class RetroTUI:
 
         title = " Band Selection (Space=toggle, Enter/Escape=done)"
         try:
-            menu_win.addstr(0, 2, title, curses.A_BOLD | self._clr(4))
+            menu_win.addstr(0, 2, title, curses.A_BOLD | theme_pair(self.crt_cfg.theme, "bright"))
         except curses.error:
             pass
 
@@ -896,7 +986,7 @@ class RetroTUI:
             if row >= h - 5:
                 break
 
-            checked = "✓" if name in self.selected_bands else " "
+            checked = "\u2713" if name in self.selected_bands else " "
             freq_str = f"{start/1e6:.3f}-{end/1e6:.3f} MHz [{demod}]"
             line = f"[{checked}] {name:<25} {freq_str}"
 
@@ -925,7 +1015,7 @@ class RetroTUI:
                 menu_win.erase()
                 menu_win.box()
                 try:
-                    menu_win.addstr(0, 2, title, curses.A_BOLD | self._clr(4))
+                    menu_win.addstr(0, 2, title, curses.A_BOLD | theme_pair(self.crt_cfg.theme, "bright"))
                 except curses.error:
                     pass
 
@@ -933,7 +1023,7 @@ class RetroTUI:
                     r = j + 2
                     if r >= h - 5:
                         break
-                    ch = "✓" if bn in self.selected_bands else " "
+                    ch = "\u2713" if bn in self.selected_bands else " "
                     fs = f"{bs/1e6:.3f}-{be/1e6:.3f} MHz [{bd}]"
                     ln = f"[{ch}] {bn:<25} {fs}"
                     try:
@@ -948,6 +1038,44 @@ class RetroTUI:
             self._status(f"Showing {len(self.selected_bands)} selected bands")
         else:
             self._status("Showing all bands")
+
+    def _show_crt_settings_menu(self):
+        """Show CRT settings overlay menu."""
+        h, w = self.stdscr.getmaxyx()
+
+        # Draw the main UI first (dimmed)
+        self.stdscr.erase()
+        self._draw_header()
+        self._draw_station_list()
+        self._draw_footer()
+
+        # Show settings overlay
+        draw_settings_menu(self.stdscr, self.crt_cfg, self._settings_cursor)
+        self.stdscr.refresh()
+
+        # Handle input in settings menu
+        done = False
+        while not done:
+            key = self.stdscr.getch()
+            if key == -1:
+                time.sleep(0.1)
+                continue
+
+            new_cursor, should_close = handle_settings_input(key, self.crt_cfg, self._settings_cursor)
+            self._settings_cursor = new_cursor
+
+            if should_close:
+                done = True
+            else:
+                # Redraw with updated settings
+                self.stdscr.erase()
+                self._draw_header()
+                self._draw_station_list()
+                self._draw_footer()
+                draw_settings_menu(self.stdscr, self.crt_cfg, self._settings_cursor)
+                self.stdscr.refresh()
+
+        self._status("CRT settings updated")
 
     def _play_current_station(self):
         """Start playing the currently selected station."""
@@ -1031,6 +1159,10 @@ class RetroTUI:
             # Band selection menu
             self._show_band_menu()
 
+        elif key == ord('t') or key == ord('T'):
+            # CRT settings menu
+            self._show_crt_settings_menu()
+
         elif key == ord('+') or key == '=' or key == ord('.'):
             # Volume up
             if self.volume < 100:
@@ -1087,6 +1219,9 @@ class RetroTUI:
 
     def run(self):
         """Main event loop."""
+        # Boot animation
+        boot_animation(self.stdscr, self.crt_cfg)
+
         # Connect to SDR
         self.stdscr.addstr(0, 0, "Connecting to SDRconnect headless...")
         self.stdscr.refresh()
@@ -1110,11 +1245,18 @@ class RetroTUI:
 
         while running:
             try:
+                # Advance CRT effects frame
+                self.crt_engine.tick()
+
                 # Clear and redraw
                 self.stdscr.erase()
                 self._draw_header()
                 self._draw_station_list()
                 self._draw_footer()
+
+                # Apply CRT visual effects overlay
+                self._apply_crt_effects()
+
                 self.stdscr.refresh()
 
                 # Handle input
